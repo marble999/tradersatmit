@@ -82,7 +82,6 @@ def market_update_method(msg, order):
 	CURRENT['TIME'] = msg['elapsed_time']
 
 	_make_good_trades(order)
-	_exit_old_trades(order)
 
 # Checks to make sure does not violate position limits or order limit
 def trader_update_method(msg, order):
@@ -94,7 +93,9 @@ def trader_update_method(msg, order):
 	CURRENT['POSITIONS'] = msg['trader_state']['positions']
 	CURRENT['OPEN_ORDERS'] = msg['trader_state']['open_orders']
 
+	_cancel_open_orders(order)
 	_make_good_trades(order)
+	_exit_old_trades(order)
 
 	# for security in positions.keys():
 	# 	if len(open_orders) > ORDER_LIMIT:
@@ -155,9 +156,9 @@ def _update_fairs():
 def _make_good_trades(order):
 	## makes trades that are good to fair if there is still position limit / order limit
 
-	if len(CURRENT['OPEN_ORDERS']) > ORDER_LIMIT:
-		print("OVER ORDER_LIMIT")
-		return; ## TODO: change this so that it actively cancels stale open orders
+	# if len(CURRENT['OPEN_ORDERS']) > ORDER_LIMIT:
+	# 	print("OVER ORDER_LIMIT")
+	# 	return; ## TODO: change this so that it actively cancels stale open orders
 
 	new_fairs = _update_fairs() # dict with (security: (bid, ask))
 
@@ -188,6 +189,11 @@ def _exit_old_trades(order):
 					curr_ask = CURRENT['OFFERS'][security]
 					order.addBuy(security, quantity=CURRENT['POSITIONS'][security], price=curr_ask)
 			CURRENT['PREDS'][security].remove((price, time, source))
+
+def _cancel_open_orders(order):
+	print("CURRENT ORDERS", CURRENT['OPEN_ORDERS'])
+	for order_id, _ in CURRENT['OPEN_ORDERS']:
+		order.addCancel(order_id)
 
 ###############################################
 #### You can add more of these if you want ####
