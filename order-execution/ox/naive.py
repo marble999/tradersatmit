@@ -6,7 +6,7 @@ import random
 ###########################################################
 
 # Make a tradersbot
-t = tt.TradersBot(host='127.0.0.1', id='trader0', password='trader0')
+t = tt.TradersBot(host='127.0.0.1', id='trader1', password='trader1')
 
 # Constants
 POS_LIMIT = 500
@@ -15,8 +15,11 @@ ORDER_LIMIT = 100
 # Keeps track of prices
 SECURITIES = {}
 PREDS = {}
-time = 0;
-open_orders = {};
+time = 0
+open_orders = {}
+
+# logging
+log_file = 'msglog.txt'
 
 # Initializes the prices
 # Initializes prediction dictionary
@@ -62,7 +65,6 @@ def market_update_method(msg, order):
 # You do not need to buy/sell here
 # Checks to make sure does not violate position limits or order limit
 def trader_update_method(msg, order):
-	print("Hello world!")
 	global SECURITIES, POS_LIMIT, open_orders
 
 	positions = msg['trader_state']['positions']
