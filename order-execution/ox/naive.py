@@ -30,6 +30,7 @@ CURRENT = {
     'TIME'          : None 
 }
 SOURCES = {} # stores all preds sorted by sources in (security, price, new_time) form
+last_cancel_time = 0 # weird hack bc my cancel_orders function is bugged
 
 # logging
 log_file = 'msglog.txt'
@@ -95,7 +96,7 @@ def trader_update_method(msg, order):
     CURRENT['POSITIONS'] = msg['trader_state']['positions']
     CURRENT['OPEN_ORDERS'] = msg['trader_state']['open_orders']
 
-    # _cancel_open_orders(order)
+    _cancel_open_orders(order)
     _make_good_trades(order)
     _exit_old_trades(order)
 
@@ -158,10 +159,10 @@ def _update_fairs():
         if fair_pred is None:
             fairs[security] = (curr_bid, curr_ask)
         else:
-            print("Real edge!")
             ci = reliability[source] / 2
             fairs[security] = (fair_pred - ci, fair_pred + ci)
 
+    print(CURRENT['TIME'], fairs)
     return fairs
 
 def _get_historical_prices():
@@ -189,19 +190,17 @@ def _estimate_reliability():
                 real_price = data[time_begin:time_end, security_idx].mean() # avg over 5 sec
                 errors.append(real_price - pred_price)
         if len(errors) == 0:
-            reliability[source] = 10.0
+            reliability[source] = 30.0
         else:
             reliability[source] = np.sqrt((np.array(errors) ** 2).mean())
 
-    print("RELIABILITY: ", str(reliability))
     return reliability
     
-
 def _estimate_rho():
     data, times = _get_historical_prices()
     corr = np.corrcoef(data.T)
     rho = np.median(corr.reshape(-1))
-    print("RHO: ", rho)
+
     return rho ## avg corr (should be pretty close to the right answer)
 
 def _make_good_trades(order):
@@ -220,10 +219,10 @@ def _make_good_trades(order):
 
         if curr_bid > fair_ask:
             ## assumes we just buy to the max (only if good info)
-            quant = POS_LIMIT + CURRENT['POSITIONS'][security] 
+            quant = min(100, POS_LIMIT + CURRENT['POSITIONS'][security])
             order.addSell(security, quantity=quant, price=fair_ask)
         if curr_ask < fair_bid:
-            quant = POS_LIMIT - CURRENT['POSITIONS'][security]
+            quant = min(100, POS_LIMIT - CURRENT['POSITIONS'][security])
             order.addBuy(security, quantity=quant, price=fair_bid)
 
 def _exit_old_trades(order):
@@ -243,10 +242,13 @@ def _exit_old_trades(order):
             CURRENT['PREDS'][security].remove((price, time, source))
 
 def _cancel_open_orders(order):
-    print("CURRENT ORDERS", CURRENT['OPEN_ORDERS'])
+    # print("CURRENT ORDERS", CURRENT['OPEN_ORDERS'])
     for order_id in CURRENT['OPEN_ORDERS'].keys():
         ticker = CURRENT['OPEN_ORDERS'][order_id]['ticker']
-        order.addCancel(ticker=ticker, orderId=order_id)
+        print(ticker, order_id)
+        print(type(ticker), type(order_id))
+        order.addCancel(ticker=ticker, orderId=int(order_id))
+    last_cancel_time = CURRENT['TIME']
 
 ###############################################
 #### You can add more of these if you want ####
