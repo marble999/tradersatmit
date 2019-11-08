@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+bool TESTING = false;
 
 struct LimitOrder {
   price_t price;
@@ -118,7 +119,8 @@ public:
 
   }
 
-  void print_book(std::string fp, const std::unordered_map<order_id_t, Common::Order>& mine={}) {
+  void print_book(std::string fp, const std::unordered_map<order_id_t, \
+                  Common::Order>& mine={}) {
     if (fp == "") {
       return;
     }
@@ -126,27 +128,19 @@ public:
     std::ofstream fout;
     fout.open(fp, std::ios::out | std::ios::app); // opens it in append mode
 
-    fout << "offers\n";
+    int64_t time = std::chrono::steady_clock::now().time_since_epoch().count();
+    
     for (auto rit = sides[0].rbegin(); rit != sides[0].rend(); rit++) {
       auto x = *rit;
-      fout << x.price << ' ' << x.quantity;
-      if (mine.count(x.order_id)) {
-        fout << " (mine)";
-      }
-      fout << '\n';
+      fout << "ORDER BOOK," << time << "," << "OFFER" << ",";
+      fout << x.price << ',' << x.quantity << ',' << x.order_id << "\n";
     }
-
-    fout << "\nbids\n";
 
     for (auto& x : sides[1]) {
-      fout << x.price << ' ' << x.quantity;
-      if (mine.count(x.order_id)) {
-        fout << " (mine)";
-      }
-      fout << '\n';
+      fout << "ORDER BOOK," << time << "," << "BID" << ",";
+      fout << x.price << ',' << x.quantity << ',' << x.order_id << "\n";
     }
 
-    fout << "EOF" << std::endl;
     fout.close();
   }
 
@@ -154,7 +148,6 @@ public:
     std::ofstream fout;
     fout.open(fp, std::ios::out | std::ios::app); // opens it in append mode
     fout << msg << std::endl;
-    fout << "EOF" << std::endl;
     fout.close();
   }
 
@@ -203,10 +196,19 @@ struct MyState {
     last_trade_price = update.price;
 
     books[update.ticker].decrease_qty(update.resting_order_id, update.quantity);
-    // books[update.ticker].print_book(log_path, open_orders);
-    std::string msg = update.getMsg();
-    books[update.ticker].print_msg(log_path, msg);
 
+    if (TESTING) {
+      books[update.ticker].print_book(log_path, open_orders);
+
+      int64_t time = std::chrono::steady_clock::now().time_since_epoch().count();
+      std::stringstream sstm;
+      sstm << "TRADE, " << time << "," << update.ticker << "," << update.price << "," << update.quantity 
+           << "," << update.buy << "," << update.resting_order_id << "," << update.aggressing_order_id << "\n";
+      std::string msg = sstm.str();
+
+      books[update.ticker].print_msg(log_path, msg);
+    }
+      
     if (submitted.count(update.resting_order_id)) {
 
       if (!submitted.count(update.aggressing_order_id)) {
@@ -247,7 +249,10 @@ struct MyState {
     };
 
     books[update.ticker].insert(order);
-    // books[update.ticker].print_book(log_path, open_orders);
+
+    if (TESTING) {
+      books[update.ticker].print_book(log_path, open_orders);
+    }
     
     if (submitted.count(update.order_id)) {
       open_orders[update.order_id] = order;
@@ -256,7 +261,10 @@ struct MyState {
 
   void on_cancel_update(const Common::CancelUpdate& update) {
     books[update.ticker].cancel(trader_id, update.order_id);
-    books[update.ticker].print_book(log_path, open_orders);
+    
+    if (TESTING) {
+      books[update.ticker].print_book(log_path, open_orders);
+    }
 
     if (open_orders.count(update.order_id)) {
       open_orders.erase(update.order_id);
@@ -329,6 +337,10 @@ public:
     start_time = time_ns();
   }
 
+  void _make_good_trades(Bot::Communicator& com) {
+    return;
+  }
+
   // EDIT THIS METHOD
   void on_trade_update(Common::TradeUpdate& update, Bot::Communicator& com){
     state.on_trade_update(update);
@@ -361,22 +373,59 @@ public:
       });
     }
 
+    _make_good_trades(com);
+
+    // 30k front-run arb // TODO: keep track of these trades, and close them out after 2e8 ns
+    if (update.quantity == 30000) {
+      std::cout << "FOUND 30K ARB" << std::endl;
+      quantity_t position = state.positions[0];
+
+      if (update.buy) { // we also want to buy
+        double best_offer = state.get_bbo(0, false);
+        quantity_t max_quantity = 2000 - position;
+
+        place_order(com, Common::Order{
+          .ticker = 0,
+          .price = best_offer+0.5,
+          .quantity = max_quantity,
+          .buy = update.buy,
+          .ioc = true,
+          .order_id = 0,
+          .trader_id = trader_id
+        });
+      }
+      else { // we want to sell
+        double best_bid = state.get_bbo(0, true);
+        quantity_t max_quantity = 2000 + position;
+        
+        place_order(com, Common::Order{
+          .ticker = 0,
+          .price = best_bid-0.5,
+          .quantity = max_quantity,
+          .buy = update.buy,
+          .ioc = true,
+          .order_id = 0, \
+          .trader_id = trader_id
+        });
+      }
+    }
+
     // a way to get your current position
-    quantity_t position = state.positions[0];
+    // quantity_t position = state.positions[0];
 
     // a way to put in a bid of quantity 1 at the current best bid
-    double best_bid = state.get_bbo(0, true);
-    if (best_bid != 0.0 && position < 20) { // 0.0 denotes no bid
-      place_order(com, Common::Order{
-        .ticker = 0,
-        .price = best_bid,
-        .quantity = 1,
-        .buy = true,
-        .ioc = false,
-        .order_id = 0, // this order ID will be chosen randomly by com
-        .trader_id = trader_id
-      });
-    }
+    // double best_bid = state.get_bbo(0, true);
+    // if (best_bid != 0.0 && position < 20) { // 0.0 denotes no bid
+    //   place_order(com, Common::Order{
+    //     .ticker = 0,
+    //     .price = best_bid,
+    //     .quantity = 1,
+    //     .buy = true,
+    //     .ioc = false,
+    //     .order_id = 0, // this order ID will be chosen randomly by com
+    //     .trader_id = trader_id
+    //   });
+    // }
 
   }
 
