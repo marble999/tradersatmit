@@ -18,6 +18,15 @@ t = tt.TradersBot(host='127.0.0.1', id='trader1', password='trader1')
 POS_LIMIT = 500
 ORDER_LIMIT = 100
 
+# Hyperparameters
+START_RELIABILITY = 30
+MIN_RELIABILITY = 10
+MAX_TRADE_SZ = 200
+
+DEFAULT_CONFIDENCE = 5
+
+MAX_DIFFERENCE = 20
+
 # Variables
 HISTORY = [] # stores all historical values, updated every 0.5 seconds
 CURRENT = {
@@ -27,10 +36,10 @@ CURRENT = {
     'BIDS'          : {}, # stores current best bids
     'OFFERS'        : {}, # stores current best offers
     'PREDS'         : {}, # stores active predictions (sorted by time) in (price, time, source) form
-    'TIME'          : None 
+    'TIME'          : 0, 
+    'LAST_NEWS_TIME': -10 # stores last time news came out
 }
 SOURCES = {} # stores all preds sorted by sources in (security, price, new_time) form
-last_cancel_time = 0 # weird hack bc my cancel_orders function is bugged
 
 # logging
 log_file = 'msglog.txt'
@@ -84,7 +93,9 @@ def market_update_method(msg, order):
     # Sets the time
     CURRENT['TIME'] = msg['elapsed_time']
 
-    _make_good_trades(order)
+    _info_arb_trades(order)
+    # _momentum_trades(order)
+    # _exit_old_trades(order)
 
 # Checks to make sure does not violate position limits or order limit
 def trader_update_method(msg, order):
@@ -97,12 +108,13 @@ def trader_update_method(msg, order):
     CURRENT['OPEN_ORDERS'] = msg['trader_state']['open_orders']
 
     _cancel_open_orders(order)
-    _make_good_trades(order)
+    # _momentum_trades(order)
+    _info_arb_trades(order)
     _exit_old_trades(order)
 
-    # historical_prices = _get_historical_prices()[0]
-    # np.savetxt("history.csv", historical_prices, delimiter=",")
-    # pickle.dump(HISTORY, open("history.pkl", 'wb'))
+    historical_prices = _get_historical_prices()[0]
+    np.savetxt("history.csv", historical_prices, delimiter=",")
+    pickle.dump(HISTORY, open("history.pkl", 'wb'))
 
 def news_method(msg, order):
     log_obj.write(str(msg) + '\n')
@@ -120,49 +132,58 @@ def news_method(msg, order):
     else:
         SOURCES[source] = [(security, price, new_time)]
 
-    curr_bid = CURRENT['BIDS'][security]
-    curr_ask = CURRENT['OFFERS'][security]
+    ## update new "news" time
+    CURRENT['LAST_NEWS_TIME'] = CURRENT['TIME']
 
-    fair_bid = price # how much we are willing to bid
-    fair_ask = price # how much we are willing to offer
-    assert(fair_bid <= fair_ask)
-
-    print("FAIRS are: ", fair_bid, fair_ask)
-    print("CURRENT MARKET: ", security, curr_bid, curr_ask)
-
-    ## TODO: add reliability into the trade
-    # if curr_bid > fair_ask:
-    #     quant = POS_LIMIT + CURRENT['POSITIONS'][security] ## assumes we just buy to the max (only if good info)
-    #     order.addSell(security, quantity=quant, price=fair_ask)
-    # if curr_ask < fair_bid:
-    #     quant = POS_LIMIT - CURRENT['POSITIONS'][security]
-    #     order.addBuy(security, quantity=quant, price=fair_bid)
+    _info_arb_trades(order)
 
 def _update_fairs():
     reliability = _estimate_reliability()
-    rho = _estimate_rho() 
+    rho, stdevs = _estimate_rho() 
 
     ## TODO: use this info from above
 
     fairs = {}
+    market_impact = [] # (stores impact in stdevs, and confidence)
+
     for security in CURRENT['POSITIONS'].keys():
         curr_bid = CURRENT['BIDS'][security]
         curr_ask = CURRENT['OFFERS'][security]
+        curr_price = CURRENT['PRICE'][security]
 
         fair_pred = None
-        closest_time = 10000 # effective INF
-        for price, new_time, source in CURRENT['PREDS'][security]:
-            if new_time <= closest_time and reliability[source] <= 20: # get the closest decent pred
+        closest_time = 100000 # effective INF
+        closest_source = None
+        for price, new_time, source in CURRENT['PREDS'][security]: # find closest, good pred
+            if new_time <= closest_time and reliability[source] <= MIN_RELIABILITY:
                 fair_pred = price
                 closest_time = new_time
+                closest_source = source
 
         if fair_pred is None:
-            fairs[security] = (curr_bid, curr_ask)
+            fairs[security] = (curr_price, DEFAULT_CONFIDENCE)
         else:
-            ci = reliability[source] / 2
-            fairs[security] = (fair_pred - ci, fair_pred + ci)
+            ci = reliability[closest_source]
+            fairs[security] = (fair_pred, ci)
+            market_impact.append(((fair_pred - curr_price) / stdevs[security], ci / stdevs[security]))
 
-    print(CURRENT['TIME'], fairs)
+        # print("Computing Fair for ", security)
+        # print("PREDS:", CURRENT['PREDS'][security])
+        # print(fairs[security])
+        # print("CURRENT BBO", CURRENT['BIDS'][security], CURRENT['OFFERS'][security])
+
+    # if CURRENT['TIME'] > 50:
+    #     print("RHO is", rho)
+    #     best_guess_market_impact = sum(el[0] for el in market_impact) / len(market_impact) # in stdevs
+    #     best_guess_market_ci = sum(el[1] for el in market_impact) / len(market_impact)
+
+    #     for security in CURRENT['POSITIONS'].keys():
+    #         beta_pred = curr_price + best_guess_market_impact * rho * stdevs[security]
+    #         beta_ci = best_guess_market_ci * rho * stdevs[security]
+            
+    #         if fairs[security][1] == DEFAULT_CONFIDENCE: # no accurate pred
+    #             fairs[security] = (beta_pred, beta_ci)
+
     return fairs
 
 def _get_historical_prices():
@@ -190,20 +211,24 @@ def _estimate_reliability():
                 real_price = data[time_begin:time_end, security_idx].mean() # avg over 5 sec
                 errors.append(real_price - pred_price)
         if len(errors) == 0:
-            reliability[source] = 30.0
+            reliability[source] = START_RELIABILITY
         else:
-            reliability[source] = np.sqrt((np.array(errors) ** 2).mean())
+            reliability[source] = np.sqrt((np.array(errors) ** 2).mean()) # mean square error
 
     return reliability
     
 def _estimate_rho():
     data, times = _get_historical_prices()
     corr = np.corrcoef(data.T)
-    rho = np.median(corr.reshape(-1))
+    rho = np.median(corr.reshape(-1)) ## avg corr (should be pretty close to the right answer)
 
-    return rho ## avg corr (should be pretty close to the right answer)
+    stdevs = {}
+    for security in CURRENT['POSITIONS'].keys():
+        stdevs[security] = np.std([entry["PRICE"][security] for entry in HISTORY])
 
-def _make_good_trades(order):
+    return rho, stdevs 
+
+def _info_arb_trades(order):
     ## makes trades that are good to fair if there is still position limit / order limit
 
     # if len(CURRENT['OPEN_ORDERS']) > ORDER_LIMIT:
@@ -211,27 +236,62 @@ def _make_good_trades(order):
     #     return; ## TODO: change this so that it actively cancels stale open orders
 
     new_fairs = _update_fairs() # dict with (security: (bid, ask))
+    # print(CURRENT['TIME'], new_fairs)
 
     for security in CURRENT['POSITIONS'].keys():
-        fair_bid, fair_ask = new_fairs[security]
+        fair, ci = new_fairs[security]
+        edge = ci / 2
+
+        fair_bid = fair - edge
+        fair_ask = fair + edge
         curr_bid = CURRENT['BIDS'][security]
         curr_ask = CURRENT['OFFERS'][security]
 
-        if curr_bid > fair_ask:
-            ## assumes we just buy to the max (only if good info)
-            quant = min(100, POS_LIMIT + CURRENT['POSITIONS'][security])
-            order.addSell(security, quantity=quant, price=fair_ask)
-        if curr_ask < fair_bid:
-            quant = min(100, POS_LIMIT - CURRENT['POSITIONS'][security])
-            order.addBuy(security, quantity=quant, price=fair_bid)
+        if ci < DEFAULT_CONFIDENCE: ## only if we have reliable info
+            if curr_bid > fair_ask:
+                ## assumes we just buy to the max (only if good info)
+                quant = min(MAX_TRADE_SZ, POS_LIMIT + CURRENT['POSITIONS'][security])
+                if quant > 10:
+                    order.addSell(security, quantity=quant, price=fair_ask)
+            if curr_ask < fair_bid:
+                quant = min(MAX_TRADE_SZ, POS_LIMIT - CURRENT['POSITIONS'][security])
+                if quant > 10:
+                    order.addBuy(security, quantity=quant, price=fair_bid)
+
+def _momentum_trades(order):
+    THRESHOLD = 2.0
+
+    data, times = _get_historical_prices()
+    if (CURRENT['TIME'] - CURRENT['LAST_NEWS_TIME'] >= 0):
+        if (CURRENT['TIME'] - CURRENT['LAST_NEWS_TIME'] <= 5):
+            for j, security in enumerate(CURRENT['POSITIONS'].keys()):
+                news_idx = np.searchsorted(times, CURRENT['LAST_NEWS_TIME'])
+                net_change_in_price =  CURRENT['PRICE'][security] - HISTORY[news_idx]['PRICE'][security]
+                
+                if (net_change_in_price > THRESHOLD):
+                    print(CURRENT['TIME'], security, net_change_in_price)
+                    curr_ask = CURRENT['OFFERS'][security]
+                    quant = min(MAX_TRADE_SZ, POS_LIMIT + CURRENT['POSITIONS'][security])
+                    if quant > 10:
+                        order.addBuy(security, quantity=quant, price=CURRENT['PRICE'][security])
+
+                elif (net_change_in_price < -THRESHOLD):
+                    print(CURRENT['TIME'], security, net_change_in_price)
+                    curr_bid = CURRENT['BIDS'][security]
+                    quant = min(MAX_TRADE_SZ, POS_LIMIT - CURRENT['POSITIONS'][security])
+                    if quant > 10:
+                        order.addSell(security, quantity=quant, price=CURRENT['PRICE'][security])
 
 def _exit_old_trades(order):
     ## gets out of stale positions when info expires
-    ## TODO: maybe adjust this for stuff that you have future info on 
+    ## TODO: maybe adjust this for stuff that you have future info on
+    reliability = _estimate_reliability()
+
     for security in CURRENT['POSITIONS'].keys():
         for price, time, source in CURRENT['PREDS'][security]:
-            if CURRENT['TIME'] > time: ## TODO: only cancel for reliable news
+            if CURRENT['TIME'] > time and reliability[source] < MIN_RELIABILITY: ## TODO: only cancel for reliable news
                 print("Clearing position for ", security, "at time ", CURRENT['TIME'])
+                print("Predicted price", price, "Real price", CURRENT['PRICE'][security])
                 ## TODO: what happens if these orders dont go through?
                 if CURRENT['POSITIONS'][security] > 0:
                     curr_bid = CURRENT['BIDS'][security]
@@ -239,16 +299,14 @@ def _exit_old_trades(order):
                 if CURRENT['POSITIONS'][security] < 0:
                     curr_ask = CURRENT['OFFERS'][security]
                     order.addBuy(security, quantity=CURRENT['POSITIONS'][security], price=curr_ask)
-            CURRENT['PREDS'][security].remove((price, time, source))
+                CURRENT['PREDS'][security].remove((price, time, source))
 
 def _cancel_open_orders(order):
     # print("CURRENT ORDERS", CURRENT['OPEN_ORDERS'])
     for order_id in CURRENT['OPEN_ORDERS'].keys():
         ticker = CURRENT['OPEN_ORDERS'][order_id]['ticker']
-        print(ticker, order_id)
-        print(type(ticker), type(order_id))
+        print("CANCEL", ticker, order_id)
         order.addCancel(ticker=ticker, orderId=int(order_id))
-    last_cancel_time = CURRENT['TIME']
 
 ###############################################
 #### You can add more of these if you want ####
