@@ -59,9 +59,7 @@ public:
     }
 
     return 0.5 * (best_bid + best_offer);
-
   }
-
 
   void insert(Common::Order order_to_insert) {
 
@@ -83,8 +81,6 @@ public:
   }
 
   void cancel(trader_id_t trader_id, order_id_t order_id) {
-
-
     if (!order_map.count(order_id)) {
       std::cout << "order " << order_id << " nonexistent" << std::endl;
       return;
@@ -98,7 +94,6 @@ public:
   }
 
   quantity_t decrease_qty(order_id_t order_id, quantity_t decrease_by) {
-
     if (!order_map.count(order_id)) {
       return -1;
     }
@@ -110,13 +105,10 @@ public:
       std::set<LimitOrder>& side = sides[(size_t)it->buy];
       side.erase(it);
       return 0;
-
     } else {
-
       it->quantity -= decrease_by;
       return it->quantity;
     }
-
   }
 
   void print_book(std::string fp, const std::unordered_map<order_id_t, \
@@ -187,7 +179,8 @@ private:
 struct MyState {
   MyState(trader_id_t trader_id) :
     trader_id(trader_id), books(), submitted(), open_orders(),
-    cash(), positions(), volume_traded(), last_trade_price(100.0),
+    cash(), positions(), volume_traded(), last_trade_price(100.0), 
+    recent_net_flow(0), recent_time(0),
     log_path("") {}
 
   MyState() : MyState(0) {}
@@ -302,6 +295,19 @@ struct MyState {
     return books[ticker].get_bbo(buy);
   }
 
+  void update_recent_net_flow(quantity_t size, int64_t time) {
+    // hyperparameter
+    int64_t refresh_freq = 1e6;
+
+    if (time - recent_time > refresh_freq) {
+      recent_net_flow = size;
+      recent_time = time;
+    }
+    else {
+      recent_net_flow += size;
+    }
+  }
+
   trader_id_t trader_id;
   MyBook books[MAX_NUM_TICKERS];
   std::unordered_set<order_id_t> submitted;
@@ -310,8 +316,12 @@ struct MyState {
   quantity_t positions[MAX_NUM_TICKERS];
   quantity_t volume_traded;
   price_t last_trade_price;
-  std::string log_path;
 
+  // extra storage
+  quantity_t recent_net_flow;
+  int64_t recent_time;
+
+  std::string log_path;
 };
 
 class MyBot : public Bot::AbstractBot {
@@ -341,6 +351,102 @@ public:
     return;
   }
 
+  void _make_30k_arb_trades(Common::OrderUpdate& update, Bot::Communicator& com) {
+    // hyperparameters
+    price_t aggressiveness = 0.50;
+    quantity_t position = state.positions[0];
+
+    // 30k front-run arb // TODO: keep track of these trades, and close them out after 2e8 ns
+    if (update.quantity == 30000) {
+      // std::cout << "FOUND 30K ARB" << std::endl;
+
+      if (update.buy) { // we also want to buy
+        double best_offer = state.get_bbo(0, false);
+        quantity_t max_quantity = 2000 - position;
+
+        if (max_quantity > 0) {
+          place_order(com, Common::Order{
+            .ticker = 0,
+            .price = best_offer+aggressiveness,
+            .quantity = max_quantity,
+            .buy = update.buy,
+            .ioc = true,
+            .order_id = 0,
+            .trader_id = trader_id
+          });
+        }
+      }
+      else { // we want to sell
+        double best_bid = state.get_bbo(0, true);
+        quantity_t max_quantity = 2000 + position;
+        
+        if (max_quantity > 0) {
+          place_order(com, Common::Order{
+            .ticker = 0,
+            .price = best_bid-aggressiveness,
+            .quantity = max_quantity,
+            .buy = update.buy,
+            .ioc = true,
+            .order_id = 0, 
+            .trader_id = trader_id
+          });
+        }
+      }
+    }
+  }
+
+  void _make_vol_arb_trades(Bot::Communicator& com) {
+    // hyperparameters
+    price_t aggressiveness = 0.01;
+    quantity_t threshold_net_flow = 1000;
+    quantity_t max_size_on_book = 100;
+    quantity_t position = state.positions[0];    
+
+    if (state.recent_net_flow > threshold_net_flow) { // lots of buying volume
+      // std::cout << "FOUND VOL ARB" << std::endl;
+      // std::cout << state.recent_net_flow << '\n';
+
+      double best_offer = state.get_bbo(0, false);
+      // quantity_t max_quantity = 2000 - position;
+      quantity_t max_quantity = std::min(max_size_on_book, 2000 - position);
+
+      if (max_quantity > 0) {
+        place_order(com, Common::Order{
+          .ticker = 0,
+          .price = best_offer+aggressiveness,
+          .quantity = max_quantity,
+          .buy = true,
+          .ioc = true,
+          .order_id = 0,
+          .trader_id = trader_id
+        });
+      }
+    }
+    else if (state.recent_net_flow < -threshold_net_flow) {
+      // std::cout << "FOUND VOL ARB" << std::endl;
+
+      double best_bid = state.get_bbo(0, true);
+      // quantity_t max_quantity = 2000 + position;
+      quantity_t max_quantity = std::min(max_size_on_book, 2000 + position);
+
+      if (max_quantity > 0) {
+        place_order(com, Common::Order{
+          .ticker = 0,
+          .price = best_bid-aggressiveness,
+          .quantity = max_quantity,
+          .buy = false,
+          .ioc = true,
+          .order_id = 0, \
+          .trader_id = trader_id
+        });
+      }
+    }
+  }
+
+  void _remove_old_trades(Bot::Communicator& com) {
+    return;
+  }
+
   // EDIT THIS METHOD
   void on_trade_update(Common::TradeUpdate& update, Bot::Communicator& com){
     state.on_trade_update(update);
@@ -348,8 +454,15 @@ public:
     if (state.submitted.count(update.resting_order_id) ||
         state.submitted.count(update.aggressing_order_id)) {
       trade_with_me_in_this_packet = true;
-    }
 
+      // log trade 
+      int64_t time = std::chrono::steady_clock::now().time_since_epoch().count();
+      std::stringstream sstm;
+      sstm << "TRADE, " << time << "," << update.ticker << "," << update.price << "," << update.quantity 
+           << "," << update.buy << "," << update.resting_order_id << "," << update.aggressing_order_id;
+      std::string msg = sstm.str();
+      state.books[update.ticker].print_msg("trades.log", msg);
+    }
   }
 
   // EDIT THIS METHOD
@@ -373,60 +486,13 @@ public:
       });
     }
 
+    // _make_30k_arb_trades(update, com);
+
+    state.update_recent_net_flow((update.buy * 2 - 1) * update.quantity, now);
+    _make_vol_arb_trades(com);
+
     _make_good_trades(com);
-
-    // 30k front-run arb // TODO: keep track of these trades, and close them out after 2e8 ns
-    if (update.quantity == 30000) {
-      std::cout << "FOUND 30K ARB" << std::endl;
-      quantity_t position = state.positions[0];
-
-      if (update.buy) { // we also want to buy
-        double best_offer = state.get_bbo(0, false);
-        quantity_t max_quantity = 2000 - position;
-
-        place_order(com, Common::Order{
-          .ticker = 0,
-          .price = best_offer+0.5,
-          .quantity = max_quantity,
-          .buy = update.buy,
-          .ioc = true,
-          .order_id = 0,
-          .trader_id = trader_id
-        });
-      }
-      else { // we want to sell
-        double best_bid = state.get_bbo(0, true);
-        quantity_t max_quantity = 2000 + position;
-        
-        place_order(com, Common::Order{
-          .ticker = 0,
-          .price = best_bid-0.5,
-          .quantity = max_quantity,
-          .buy = update.buy,
-          .ioc = true,
-          .order_id = 0, \
-          .trader_id = trader_id
-        });
-      }
-    }
-
-    // a way to get your current position
-    // quantity_t position = state.positions[0];
-
-    // a way to put in a bid of quantity 1 at the current best bid
-    // double best_bid = state.get_bbo(0, true);
-    // if (best_bid != 0.0 && position < 20) { // 0.0 denotes no bid
-    //   place_order(com, Common::Order{
-    //     .ticker = 0,
-    //     .price = best_bid,
-    //     .quantity = 1,
-    //     .buy = true,
-    //     .ioc = false,
-    //     .order_id = 0, // this order ID will be chosen randomly by com
-    //     .trader_id = trader_id
-    //   });
-    // }
-
+    _remove_old_trades(com);
   }
 
   // EDIT THIS METHOD
