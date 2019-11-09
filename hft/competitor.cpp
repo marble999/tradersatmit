@@ -347,8 +347,39 @@ public:
     start_time = time_ns();
   }
 
-  void _make_good_trades(Bot::Communicator& com) {
-    return;
+  void _make_mm_trades(Common::OrderUpdate& update, Bot::Communicator& com) {
+    // hyperparameters
+    price_t aggressiveness = 0.01;
+    quantity_t position = state.positions[0];
+    quantity_t max_size_on_book = 100;
+    price_t min_spread = 0.20;
+
+    if (state.books[update.ticker].spread() > min_spread) {
+      if (position > -1000) { //mm sell
+        double best_offer = state.get_bbo(0, false);
+        place_order(com, Common::Order{
+          .ticker = 0,
+          .price = best_offer - aggressiveness,
+          .quantity = max_size_on_book,
+          .buy = false,
+          .ioc = false,
+          .order_id = 0,
+          .trader_id = trader_id
+        });
+      }
+      else if (position < 1000) { //mm buy
+        double best_bid = state.get_bbo(0, true);
+        place_order(com, Common::Order{
+          .ticker = 0,
+          .price = best_bid + aggressiveness,
+          .quantity = max_size_on_book,
+          .buy = true,
+          .ioc = false,
+          .order_id = 0,
+          .trader_id = trader_id
+        });
+      }
+    }
   }
 
   void _make_30k_arb_trades(Common::OrderUpdate& update, Bot::Communicator& com) {
@@ -471,7 +502,7 @@ public:
 
     // a way to rate limit yourself
     int64_t now = time_ns();
-    if (now - last < 10e6) { // 10ms
+    if (now - last < 1e5) { // 10ms
       return;
     }
 
@@ -486,12 +517,13 @@ public:
       });
     }
 
-    // _make_30k_arb_trades(update, com);
+    _make_30k_arb_trades(update, com);
 
-    state.update_recent_net_flow((update.buy * 2 - 1) * update.quantity, now);
-    _make_vol_arb_trades(com);
+    // state.update_recent_net_flow((update.buy * 2 - 1) * update.quantity, now);
+    // _make_vol_arb_trades(com);
 
-    _make_good_trades(com);
+    _make_mm_trades(update, com);
+
     _remove_old_trades(com);
   }
 
