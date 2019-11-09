@@ -180,7 +180,7 @@ struct MyState {
   MyState(trader_id_t trader_id) :
     trader_id(trader_id), books(), submitted(), open_orders(),
     cash(), positions(), volume_traded(), last_trade_price(100.0), 
-    recent_net_flow(0), recent_time(0),
+    recent_net_flow(0), recent_time(0), mm_blocked_bids(false), mm_blocked_offers(false), mm_blocked_till(0),
     log_path("") {}
 
   MyState() : MyState(0) {}
@@ -249,6 +249,27 @@ struct MyState {
     
     if (submitted.count(update.order_id)) {
       open_orders[update.order_id] = order;
+    }
+
+    int64_t time = std::chrono::steady_clock::now().time_since_epoch().count();
+
+    // blocking for mm
+    if (update.quantity == 30000) {
+      if (update.buy) { // block selling
+        mm_blocked_offers = true; 
+        mm_blocked_bids = false;
+        mm_blocked_till = time + 1e6;
+      }
+      else { // block buying
+        mm_blocked_offers = false;
+        mm_blocked_bids = true; 
+        mm_blocked_till = time + 1e6;
+      }
+    }
+
+    if ((int64_t) time > mm_blocked_till) { //unblock everything
+      mm_blocked_offers = false;
+      mm_blocked_bids = false;
     }
   }
 
@@ -321,6 +342,11 @@ struct MyState {
   quantity_t recent_net_flow;
   int64_t recent_time;
 
+  // market-making blocks
+  bool mm_blocked_bids; // don't post mm bids
+  bool mm_blocked_offers; // don't post mm offers
+  int64_t mm_blocked_till; // when to reset blocks
+
   std::string log_path;
 };
 
@@ -355,7 +381,7 @@ public:
     price_t min_spread = 0.20;
 
     if (state.books[update.ticker].spread() > min_spread) {
-      if (position > -1000) { //mm sell
+      if ((position > -1000) and (not state.mm_blocked_offers)) { //mm sell
         double best_offer = state.get_bbo(0, false);
         place_order(com, Common::Order{
           .ticker = 0,
@@ -367,7 +393,7 @@ public:
           .trader_id = trader_id
         });
       }
-      else if (position < 1000) { //mm buy
+      else if ((position < 1000) and (not state.mm_blocked_bids)) { //mm buy
         double best_bid = state.get_bbo(0, true);
         place_order(com, Common::Order{
           .ticker = 0,
