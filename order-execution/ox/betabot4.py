@@ -4,6 +4,7 @@ import numpy as np
 import sklearn as sk
 import pandas as pd
 import pickle
+import sys
 
 from copy import deepcopy
 
@@ -12,7 +13,7 @@ from copy import deepcopy
 ###########################################################
 
 # Make a tradersbot
-t = tt.TradersBot(host='127.0.0.1', id='trader6', password='trader6')
+t = tt.TradersBot(host='3.90.186.196', id='Harvard4', password='usfbx1cxaL')
 
 # Constants
 POS_LIMIT = 500
